@@ -1,5 +1,7 @@
+import path from "path"
 import type { Config, Hooks, Plugin } from "@opencode-ai/plugin"
 import type { Auth } from "@opencode-ai/sdk/v2"
+import { Global } from "@opencode-ai/core/global"
 import { OAUTH_DUMMY_KEY } from "../auth"
 
 /**
@@ -21,8 +23,22 @@ import { OAUTH_DUMMY_KEY } from "../auth"
  *   code-assist request wrapper (`{model, user_prompt_id, request}`) and an
  *   SSE response whose chunks carry the generate-content response under a
  *   `response` field that must be unwrapped for the AI SDK.
+ *
+ * Every subscription OAuth token is short-lived (kimi ~15 min, gemini 1 h,
+ * grok/claude a few hours), so the bearer loaders refresh on expiry through
+ * the provider's verified refresh endpoint and persist the rotated token
+ * bundle back to auth.json.
  */
 type AuthKind = "api-key" | "bearer" | "gemini-code-assist"
+
+/** A verified OAuth refresh endpoint for a subscription provider. */
+type OAuthSpec = {
+  url: string
+  clientId: string
+  clientSecret?: string
+  /** Anthropic's endpoint takes a JSON body; the others take form data. */
+  json?: boolean
+}
 
 type Spec = {
   id: string
@@ -33,6 +49,7 @@ type Spec = {
   auth: AuthKind
   prompt: string
   headers?: Record<string, string>
+  oauth?: OAuthSpec
   models: Record<
     string,
     {
@@ -81,6 +98,33 @@ const GEMINI_MODELS: Spec["models"] = {
   "gemini-3-pro": { name: "Gemini 3 Pro", context: GEMINI_CONTEXT, output: GEMINI_MAX_OUTPUT },
 }
 
+const CLAUDE_SUB_OAUTH = {
+  url: "https://api.anthropic.com/v1/oauth/token",
+  clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+  json: true,
+} satisfies OAuthSpec
+
+const KIMI_SUB_OAUTH = {
+  url: "https://auth.kimi.com/api/oauth/token",
+  clientId: "17e5f671-d194-4dfb-9706-5516cb48c098",
+} satisfies OAuthSpec
+
+const GROK_SUB_OAUTH = {
+  url: "https://auth.x.ai/oauth2/token",
+  clientId: "b1a00492-073a-47ea-816f-4c329264a828",
+} satisfies OAuthSpec
+
+const GEMINI_OAUTH_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
+const GEMINI_OAUTH_CLIENT_SECRET = "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"
+
+const GEMINI_SUB_OAUTH = {
+  url: "https://oauth2.googleapis.com/token",
+  clientId: GEMINI_OAUTH_CLIENT_ID,
+  clientSecret: GEMINI_OAUTH_CLIENT_SECRET,
+} satisfies OAuthSpec
+
+const GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+
 const SPECS: Spec[] = [
   {
     id: "kimi-code",
@@ -100,6 +144,7 @@ const SPECS: Spec[] = [
     api: "https://api.kimi.com/coding/v1",
     auth: "bearer",
     prompt: "Kimi subscription OAuth token",
+    oauth: KIMI_SUB_OAUTH,
     models: KIMI_MODELS,
   },
   {
@@ -111,6 +156,7 @@ const SPECS: Spec[] = [
     auth: "bearer",
     prompt: "Claude subscription OAuth token",
     headers: { "anthropic-beta": "oauth-2025-04-20" },
+    oauth: CLAUDE_SUB_OAUTH,
     models: CLAUDE_MODELS,
   },
   {
@@ -126,6 +172,7 @@ const SPECS: Spec[] = [
       "x-grok-client-identifier": "grok-shell",
       "x-grok-client-version": "0.2.93",
     },
+    oauth: GROK_SUB_OAUTH,
     models: GROK_MODELS,
   },
   {
@@ -137,6 +184,7 @@ const SPECS: Spec[] = [
     auth: "gemini-code-assist",
     prompt:
       "Gemini subscription OAuth token, as JSON {\"access\":...,\"refresh\":...,\"expires\":...} or a bare access token",
+    oauth: GEMINI_SUB_OAUTH,
     models: GEMINI_MODELS,
   },
 ]
@@ -179,11 +227,103 @@ function bearerFetch(getAuth: () => Promise<Auth>, extra?: Record<string, string
   }
 }
 
-const GEMINI_OAUTH_CLIENT_ID = "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com"
-const GEMINI_OAUTH_CLIENT_SECRET = "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"
-const GEMINI_CODE_ASSIST_URL = "https://cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"
+function oauthFetch(spec: Spec, getAuth: () => Promise<Auth>) {
+  return async function fetchWithOAuth(input: RequestInfo | URL, init?: RequestInit) {
+    const auth = await getAuth()
+    const stored = tokenOf(auth)
+    if (!stored) return fetch(input, init)
+    let access = stored
+    if (auth.type === "oauth" && auth.refresh && auth.expires < Date.now()) {
+      const refreshed = await refreshAndPersist(spec, auth.refresh)
+      access = refreshed.access
+    }
+    const headers = new Headers(init?.headers)
+    headers.delete("x-api-key")
+    headers.delete("authorization")
+    headers.set("authorization", `Bearer ${access}`)
+    for (const [key, value] of Object.entries(spec.headers ?? {})) headers.set(key, value)
+    return fetch(input, { ...init, headers })
+  }
+}
+
+const AUTH_FILE = path.join(Global.Path.data, "auth.json")
 
 type GeminiToken = { access: string; refresh?: string; expires?: number }
+const refreshInflight = new Map<string, Promise<{ access: string; refresh?: string; expires: number }>>()
+let authWrite = Promise.resolve()
+
+/** A refreshed token bundle, persisted to auth.json under the provider id. */
+type RefreshedToken = { access: string; refresh?: string; expires: number }
+
+function refreshRequest(spec: OAuthSpec, refreshToken: string): RequestInit {
+  const params: Record<string, string> = {
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: spec.clientId,
+    ...(spec.clientSecret !== undefined ? { client_secret: spec.clientSecret } : {}),
+  }
+  if (spec.json) {
+    return {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(params),
+    }
+  }
+  return {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(params),
+  }
+}
+
+async function refreshOAuthToken(spec: OAuthSpec, refreshToken: string): Promise<RefreshedToken> {
+  const res = await fetch(spec.url, refreshRequest(spec, refreshToken))
+  if (!res.ok) throw new Error(`Token refresh failed (HTTP ${res.status}) for ${spec.url}`)
+  const data = (await res.json()) as { access_token?: unknown; refresh_token?: unknown; expires_in?: unknown }
+  if (typeof data.access_token !== "string") throw new Error(`Token refresh response missing access_token for ${spec.url}`)
+  const expiresIn = typeof data.expires_in === "number" && data.expires_in > 0 ? data.expires_in : 3600
+  return {
+    access: data.access_token,
+    refresh: typeof data.refresh_token === "string" ? data.refresh_token : undefined,
+    expires: Date.now() + (expiresIn - 120) * 1000,
+  }
+}
+
+async function persistAuth(providerID: string, token: RefreshedToken): Promise<void> {
+  const write = authWrite.then(async () => {
+    let data: Record<string, unknown>
+    try {
+      data = JSON.parse(await Bun.file(AUTH_FILE).text()) as Record<string, unknown>
+    } catch {
+      data = {}
+    }
+    data[providerID] = {
+      type: "oauth",
+      access: token.access,
+      refresh: token.refresh ?? "",
+      expires: token.expires,
+    }
+    await Bun.write(AUTH_FILE, JSON.stringify(data, null, 2))
+  })
+  authWrite = write.catch(() => {})
+  return write
+}
+
+/** Refresh once per provider, sharing the in-flight call across concurrent requests. */
+function refreshAndPersist(spec: Spec, refreshToken: string): Promise<RefreshedToken> {
+  const oauth = spec.oauth
+  if (oauth === undefined) throw new Error(`No oauth refresh configured for ${spec.id}`)
+  let inflight = refreshInflight.get(spec.id)
+  if (inflight === undefined) {
+    inflight = refreshOAuthToken(oauth, refreshToken).then(async (token) => {
+      if (token.refresh !== undefined) await persistAuth(spec.id, token)
+      return token
+    })
+    refreshInflight.set(spec.id, inflight)
+    inflight.finally(() => refreshInflight.delete(spec.id)).catch(() => {})
+  }
+  return inflight
+}
 
 function geminiToken(auth: Auth): GeminiToken | undefined {
   if (auth.type === "oauth") {
@@ -205,23 +345,6 @@ function geminiToken(auth: Auth): GeminiToken | undefined {
     return { access: auth.key }
   }
   return undefined
-}
-
-async function refreshGeminiToken(refreshToken: string): Promise<{ access: string; expires: number }> {
-  const params = new URLSearchParams({
-    grant_type: "refresh_token",
-    client_id: GEMINI_OAUTH_CLIENT_ID,
-    client_secret: GEMINI_OAUTH_CLIENT_SECRET,
-    refresh_token: refreshToken,
-  })
-  const res = await fetch("https://oauth2.googleapis.com/token", {
-    method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: params,
-  })
-  if (!res.ok) throw new Error(`Gemini token refresh failed: ${res.status}`)
-  const data = (await res.json()) as { access_token: string; expires_in: number }
-  return { access: data.access_token, expires: Date.now() + (data.expires_in - 120) * 1000 }
 }
 
 function unwrapGeminiSSE(body: ReadableStream<Uint8Array>): ReadableStream<Uint8Array> {
@@ -269,14 +392,14 @@ function unwrapGeminiSSE(body: ReadableStream<Uint8Array>): ReadableStream<Uint8
   )
 }
 
-function geminiFetch(getAuth: () => Promise<Auth>) {
+function geminiFetch(spec: Spec, getAuth: () => Promise<Auth>) {
   return async function fetchWithCodeAssist(input: RequestInfo | URL, init?: RequestInit) {
     const auth = await getAuth()
     const stored = geminiToken(auth)
     if (!stored) return fetch(input, init)
     let access = stored.access
     if (stored.refresh && stored.expires !== undefined && stored.expires < Date.now()) {
-      const refreshed = await refreshGeminiToken(stored.refresh)
+      const refreshed = await refreshAndPersist(spec, stored.refresh)
       access = refreshed.access
     }
     let model = "gemini-3.6-flash"
@@ -338,8 +461,10 @@ function authHook(spec: Spec): Hooks["auth"] {
             apiKey: OAUTH_DUMMY_KEY,
             fetch:
               spec.auth === "gemini-code-assist"
-                ? geminiFetch(getAuth)
-                : bearerFetch(getAuth, spec.headers),
+                ? geminiFetch(spec, getAuth)
+                : spec.oauth !== undefined
+                  ? oauthFetch(spec, getAuth)
+                  : bearerFetch(getAuth, spec.headers),
           }),
         }),
   }
